@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+
+import docker
+import tarfile
+import io
+import json
+import os
+import hashlib
+
+client = docker.DockerClient(base_url='unix://var/run/docker.sock')
+
+# if one wants to use private registry
+#client.login(username='albert.einstein',password='XXXXXXXXXXXX',registry='https://containers.ligo.org')
+#client.images.pull('containers.ligo.org/thomas.downes/testing:0bf252c08a315e36141d61fe0b916e60ba2d297e')
+#image = client.images.get('containers.ligo.org/thomas.downes/testing:0bf252c08a315e36141d61fe0b916e60ba2d297e')
+
+client.images.pull('centos:6')
+image = client.images.get('centos:6')
+tarobj = io.BytesIO(image.save().read())
+tf = tarfile.open(mode='r',fileobj=tarobj)
+manifest = json.loads(tf.extractfile('manifest.json').read().decode('utf-8'))[0]
+tarballs = manifest['Layers']
+
+hasher = hashlib.sha256()
+for tarball in tarballs:
+  layer_hash = tarball.split('/')[0].encode('ascii')
+  print(layer_hash)
+  hasher.update(layer_hash)
+
+image_hash = hasher.hexdigest()
+image_dir = os.path.join('/tmp/tpdownes', '.images', image_hash[0:2], image_hash[2:])
+
+if not os.path.exists(image_dir):
+  os.makedirs(image_dir)
+
+for tarball in tarballs:
+  tb = tarfile.open(mode='r',fileobj=tf.extractfile(tarball))
+  tb.extractall(path=image_dir)
