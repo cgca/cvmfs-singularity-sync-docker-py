@@ -1,38 +1,88 @@
 #!/usr/bin/python3
 
-import docker
-import tarfile
-import io
-import json
 import os
-import hashlib
+from sys import exit
+import argparse
+import ctypes
+import docker
+import tempfile
 
-client = docker.DockerClient(base_url='unix://var/run/docker.sock')
+def mount(source, target, fs, options=""):
+  ret = ctypes.CDLL("libc.so.6", use_errno=True).mount(source, target, fs, 0, options)
+  if ret < 0:
+    errno = ctypes.get_errno()
+    raise RuntimeError("Error mounting {} ({}) on {} with options '{}': {}".
+     format(source, fs, target, options, os.strerror(errno)))
 
-# if one wants to use private registry
-#client.login(username='albert.einstein',password='XXXXXXXXXXXX',registry='https://containers.ligo.org')
-#client.images.pull('containers.ligo.org/thomas.downes/testing:0bf252c08a315e36141d61fe0b916e60ba2d297e')
-#image = client.images.get('containers.ligo.org/thomas.downes/testing:0bf252c08a315e36141d61fe0b916e60ba2d297e')
+def umount(target):
+    ret = ctypes.CDLL("libc.so.6", use_errno=True).umount(target)
+    if ret < 0:
+        errno = ctypes.get_errno()
+        raise RuntimeError("Error unmounting {}: {}".format(target, os.strerror(errno)))
 
-client.images.pull('centos:6')
-image = client.images.get('centos:6')
-tarobj = io.BytesIO(image.save().read())
-tf = tarfile.open(mode='r',fileobj=tarobj)
-manifest = json.loads(tf.extractfile('manifest.json').read().decode('utf-8'))[0]
-tarballs = manifest['Layers']
+def find_overlay_link_from_diff(diff_dir):
+    if os.path.exists(diff_dir):
+        link_file = open(diff_dir.replace("diff", "link"),"r")
+        link_name = link_file.readline()
+        return ("/var/lib/docker/overlay2/l/" + link_name)
+    else:
+        return None
 
-hasher = hashlib.sha256()
-for tarball in tarballs:
-  layer_hash = tarball.split('/')[0].encode('ascii')
-  print(layer_hash)
-  hasher.update(layer_hash)
+helpString = "Download a Docker image and publish it to CVMFS"
+parser = argparse.ArgumentParser(description=helpString,
+        formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("image", type=str,
+        help="Docker image and tag, e.g. centos:6")
+parser.add_argument("-r","--registry", required=False, type=str,
+        help="Registry URI")
+private_registry_args = parser.add_argument_group("Registry Credentials")
+private_registry_args.add_argument("-u","--username", required=False, type=str,
+        help="Username for registry")
+private_registry_args.add_argument("-t","--token", required=False, type=str,
+        help="Authentication token for registry")
+args = parser.parse_args()
 
-image_hash = hasher.hexdigest()
-image_dir = os.path.join('/tmp/tpdownes', '.images', image_hash[0:2], image_hash[2:])
+creds = (args.username,args.token)
+if creds.count(None) == 1:
+    parser.error("Must provide both authentication username and token or neither!")
 
-if not os.path.exists(image_dir):
-  os.makedirs(image_dir)
+client = docker.from_env()
 
-for tarball in tarballs:
-  tb = tarfile.open(mode='r',fileobj=tf.extractfile(tarball))
-  tb.extractall(path=image_dir)
+if args.username is not None and args.token is not None:
+    client.login(username=args.username, password=args.token,
+            registry=args.registry)
+
+image = client.images.pull(args.image)
+
+# in images that I have seen, there are 0-N lower dirs and exactly 1 upper dir
+# with 0 lower dirs being common for "root" images like centos.
+#
+# The goal is to find the short link for each directory (this avoids page size
+# limitations on arguments to mount) and recombine them into a single list.
+# The link corresponding to upperdir will come first followed by the links for
+# the lowerdirs in their original order. We will remount them as a single
+# overlay of multiple lowerdirs so that the result is read-only. In the instance
+# that there is 1 upper dir and 0 lower dirs, we will create a fake empty
+# directory for the lowest layer. 
+
+image_data = image.attrs["GraphDriver"]["Data"]
+lower_dirs = image_data["LowerDir"].split(":") if "LowerDir" in image_data else []
+upper_dirs = image_data["UpperDir"].split(":") if "UpperDir" in image_data else []
+combined_dirs = upper_dirs + lower_dirs
+
+combined_links = ":".join(map(find_overlay_link_from_diff, combined_dirs))
+
+tmp_empty_dir = None
+if len(combined_dirs) == 1:
+    tmp_empty_dir = tempfile.mkdtemp(prefix="empty-dir-", dir="/tmp")
+    combined_links += ":" + tmp_empty_dir
+
+mount_point = tempfile.mkdtemp(prefix="singularity-image-", dir="/tmp")
+mount(b"overlay", mount_point.encode(), b"overlay",
+        b"lowerdir=" + combined_links.encode())
+
+# cleanup mount point and fake empty directory, if necessary
+umount(mount_point)
+os.rmdir(mount_point)
+if tmp_empty_dir is not None:
+    os.rmdir(tmp_empty_dir)
